@@ -1,4 +1,6 @@
 import asyncio
+import json
+import random
 import types
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -11,8 +13,10 @@ import utils.globals as globals
 from app import app, templates, security_scheme
 from chatgpt.ChatService import ChatService
 from chatgpt.authorization import refresh_all_tokens
+from api.tokens import split_tokens_from_content
 from utils.Logger import logger
 from utils.configs import api_prefix, scheduled_refresh
+from utils.admin_store import enabled_models, find_model, is_managed_key_format, record_api_key_usage, resolve_api_key, runtime_config
 from utils.retry import async_retry
 
 scheduler = AsyncIOScheduler()
@@ -49,19 +53,60 @@ async def process(request_data, req_token):
     return chat_service, res
 
 
+async def track_stream_usage(response, key_id, chat_service):
+    content = ""
+    completed = False
+    try:
+        async for chunk in response:
+            if chunk.startswith("data: [DONE]"):
+                completed = True
+            elif chunk.startswith("data: "):
+                try:
+                    data = json.loads(chunk[6:])
+                    content += data.get("choices", [{}])[0].get("delta", {}).get("content") or ""
+                except (ValueError, TypeError, IndexError):
+                    pass
+            yield chunk
+    finally:
+        if completed:
+            _, completion_tokens, _ = await split_tokens_from_content(content, chat_service.max_tokens, chat_service.resp_model)
+            prompt_tokens = int(chat_service.prompt_tokens)
+            record_api_key_usage(key_id, {
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens + completion_tokens,
+            })
+
+
 @app.post(f"/{api_prefix}/v1/chat/completions" if api_prefix else "/v1/chat/completions")
 async def send_conversation(request: Request, credentials: HTTPAuthorizationCredentials = Security(security_scheme)):
     req_token = credentials.credentials
+    managed_key = resolve_api_key(req_token)
+    if is_managed_key_format(req_token) and not managed_key:
+        raise HTTPException(status_code=401, detail={"error": "Invalid or disabled API key"})
     try:
         request_data = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail={"error": "Invalid JSON body"})
-    chat_service, res = await async_retry(process, request_data, req_token)
+    if managed_key:
+        model = find_model(request_data.get("model", ""))
+        if not model or not model.get("enabled", True):
+            raise HTTPException(status_code=400, detail={"error": "Model not found or disabled"})
+        request_data["model"] = model.get("upstream_model") or model["id"]
+        available_tokens = list(set(globals.token_list) - set(globals.error_token_list))
+        req_token = random.choice(available_tokens) if runtime_config["random_token"] and available_tokens else (available_tokens[0] if available_tokens else "")
+        if not req_token:
+            raise HTTPException(status_code=503, detail={"error": "No available upstream token"})
+    chat_service, res = await async_retry(process, request_data, req_token, max_retries=int(runtime_config["retry_times"]))
     try:
         if isinstance(res, types.AsyncGeneratorType):
+            if managed_key:
+                res = track_stream_usage(res, managed_key["id"], chat_service)
             background = BackgroundTask(chat_service.close_client)
             return StreamingResponse(res, media_type="text/event-stream", background=background)
         else:
+            if managed_key and res.get("usage"):
+                record_api_key_usage(managed_key["id"], res["usage"])
             background = BackgroundTask(chat_service.close_client)
             return JSONResponse(res, media_type="application/json", background=background)
     except HTTPException as e:
@@ -74,6 +119,18 @@ async def send_conversation(request: Request, credentials: HTTPAuthorizationCred
         await chat_service.close_client()
         logger.error(f"Server error, {str(e)}")
         raise HTTPException(status_code=500, detail="Server error")
+
+
+@app.get(f"/{api_prefix}/v1/models" if api_prefix else "/v1/models")
+async def list_models(credentials: HTTPAuthorizationCredentials = Security(security_scheme)):
+    token = credentials.credentials
+    if is_managed_key_format(token) and not resolve_api_key(token):
+        raise HTTPException(status_code=401, detail={"error": "Invalid or disabled API key"})
+    if not is_managed_key_format(token):
+        from utils.configs import authorization_list
+        if authorization_list and token not in authorization_list and token not in globals.token_list:
+            raise HTTPException(status_code=401, detail={"error": "Invalid API key"})
+    return {"object": "list", "data": [{"id": item["id"], "object": "model", "created": item.get("created", 0), "owned_by": "chat2api"} for item in enabled_models()]}
 
 
 @app.get(f"/{api_prefix}/tokens" if api_prefix else "/tokens", response_class=HTMLResponse)
